@@ -332,6 +332,7 @@ void leerComandosSerial() {
       comandoSerial += c;
     }
   }
+  return fase;
 }
 
 void setup() {
