@@ -1,21 +1,21 @@
 #include <Arduino.h>
 #include <math.h>
+#include <string.h>
 
 // Detector de metales por desfase TX/RX con lock-in digital.
 // MCU objetivo: ATmega328P a 16 MHz.
 //
-// NOTA práctica: 8 kHz con 128 muestras/ciclo requiere actualizar SPWM a
-// 1,024 MHz y muestrear dos canales ADC a ese ritmo de bloque, lo cual deja
-// muy poco margen en un ATmega328P. Las constantes quedan centralizadas para
-// ajustar la frecuencia de trabajo durante la puesta en marcha.
+// La versión de depuración prioriza que el puerto serie responda y que la RAM
+// quede con margen suficiente. Para 8 kHz/128 muestras sería necesaria una ISR
+// de 1,024 MHz, demasiado agresiva para depurar comandos en un ATmega328P.
 
 constexpr uint8_t NUM_MUESTRAS = 128;
 constexpr uint32_t MCU_CLOCK_HZ = 16000000UL;
-constexpr uint16_t F_TX_HZ = 8000;
+constexpr uint16_t F_TX_HZ = 1000;
 constexpr uint32_t F_UPDATE_HZ = static_cast<uint32_t>(F_TX_HZ) * NUM_MUESTRAS;
 constexpr uint8_t ADC_CANAL_TX = 0;  // ADC0: shunt corriente TX
 constexpr uint8_t ADC_CANAL_RX = 1;  // ADC1: bobina RX acondicionada
-constexpr uint8_t PIN_PWM_TX = 3;    // OC2B: salida SPWM hacia filtro RC/PAM8610
+constexpr uint8_t PIN_PWM_TX = 9;    // OC1A: salida SPWM hacia filtro RC/PAM8610
 
 // Tabla seno centrada para SPWM: 0..255, media 128.
 const uint8_t tablaSenoPWM[NUM_MUESTRAS] PROGMEM = {
@@ -84,7 +84,7 @@ volatile bool bloqueCompleto = false;
 volatile bool descartarConversion = false;
 volatile uint16_t bufferADC[2][NUM_MUESTRAS];
 
-uint16_t bufferDSP[2][NUM_MUESTRAS];
+uint16_t bloqueTrabajo[NUM_MUESTRAS];
 uint16_t ultimoBloque[2][NUM_MUESTRAS];
 
 
@@ -109,11 +109,12 @@ EstadoDSP estadoDSP = {};
 bool txActivo = true;
 bool dspActivo = true;
 float faseReferenciaRad = 0.0f;
-String comandoSerial;
+char comandoSerial[16];
+uint8_t comandoLen = 0;
 
 
-ISR(TIMER1_COMPA_vect) {
-  OCR2B = pgm_read_byte(&tablaSenoPWM[indicePWM]);
+ISR(TIMER2_COMPA_vect) {
+  OCR1A = pgm_read_byte(&tablaSenoPWM[indicePWM]);
   indicePWM++;
   if (indicePWM >= NUM_MUESTRAS) {
     indicePWM = 0;
@@ -145,29 +146,31 @@ void activarTX(bool activar) {
   txActivo = activar;
   if (activar) {
     indicePWM = 0;
-    OCR2B = 128;
-    TIMSK1 |= _BV(OCIE1A);
+    OCR1A = 128;
+    TIMSK2 |= _BV(OCIE2A);
   } else {
-    TIMSK1 &= ~_BV(OCIE1A);
-    OCR2B = 128;
+    TIMSK2 &= ~_BV(OCIE2A);
+    OCR1A = 128;
   }
 }
 
 void configurarSPWM() {
   pinMode(PIN_PWM_TX, OUTPUT);
 
-  // Timer2: Fast PWM 8-bit no inversor en OC2B, sin prescaler.
-  // Portadora PWM aproximada: 16 MHz / 256 = 62,5 kHz.
-  TCCR2A = _BV(COM2B1) | _BV(WGM21) | _BV(WGM20);
-  TCCR2B = _BV(CS20);
-  OCR2B = 128;
-
-  // Timer1: CTC para avanzar la tabla seno.
-  TCCR1A = 0;
+  // Timer1 (16 bits): Fast PWM 8-bit no inversor en OC1A, sin prescaler.
+  // La portadora PWM queda en 16 MHz / 256 = 62,5 kHz.
+  TCCR1A = _BV(COM1A1) | _BV(WGM10);
   TCCR1B = _BV(WGM12) | _BV(CS10);
+  OCR1A = 128;
+
+  // Timer2 solo marca la cadencia de actualización de la tabla seno.
+  TCCR2A = _BV(WGM21);
+  TCCR2B = _BV(CS20);
   const uint32_t ciclosActualizacion = MCU_CLOCK_HZ / F_UPDATE_HZ;
-  OCR1A = (ciclosActualizacion > 1) ? (ciclosActualizacion - 1) : 1;
-  TIMSK1 = _BV(OCIE1A);
+  OCR2A = (ciclosActualizacion > 1 && ciclosActualizacion <= 256)
+    ? (ciclosActualizacion - 1)
+    : 124;
+  TIMSK2 = _BV(OCIE2A);
   activarTX(true);
 }
 
@@ -290,46 +293,59 @@ void enviarEstado() {
   Serial.println(NUM_MUESTRAS);
 }
 
-void procesarComando(const String &cmd) {
-  if (cmd == F("TX_ON")) {
+bool comandoEs(const char *esperado) {
+  return strcmp(comandoSerial, esperado) == 0;
+}
+
+void procesarComando() {
+  if (comandoEs("TX_ON")) {
     activarTX(true);
     Serial.println(F("OK,TX_ON"));
-  } else if (cmd == F("TX_OFF")) {
+  } else if (comandoEs("TX_OFF")) {
     activarTX(false);
     Serial.println(F("OK,TX_OFF"));
-  } else if (cmd == F("READ_TX") || cmd == F("DEBUG_TX")) {
+  } else if (comandoEs("READ_TX") || comandoEs("DEBUG_TX")) {
     enviarBloqueCanal(ADC_CANAL_TX, F("TX"));
-  } else if (cmd == F("READ_RX") || cmd == F("DEBUG_RX")) {
+  } else if (comandoEs("READ_RX") || comandoEs("DEBUG_RX")) {
     enviarBloqueCanal(ADC_CANAL_RX, F("RX"));
-  } else if (cmd == F("READ_ALL")) {
+  } else if (comandoEs("READ_ALL")) {
     enviarBloquesTXRX();
-  } else if (cmd == F("DSP_ON")) {
+  } else if (comandoEs("DSP_ON")) {
     dspActivo = true;
     Serial.println(F("OK,DSP_ON"));
-  } else if (cmd == F("DSP_OFF")) {
+  } else if (comandoEs("DSP_OFF")) {
     dspActivo = false;
     Serial.println(F("OK,DSP_OFF"));
-  } else if (cmd == F("RESULT") || cmd == F("READ_DSP")) {
+  } else if (comandoEs("RESULT") || comandoEs("READ_DSP")) {
     enviarResultadosDSP();
-  } else if (cmd == F("CAL")) {
+  } else if (comandoEs("CAL")) {
     calibrarFaseBase();
-  } else if (cmd == F("STATUS")) {
+  } else if (comandoEs("STATUS")) {
     enviarEstado();
-  } else if (cmd.length() > 0) {
+  } else if (comandoLen > 0) {
     Serial.print(F("ERR,UNKNOWN_CMD,"));
-    Serial.println(cmd);
+    Serial.println(comandoSerial);
   }
+}
+
+void finalizarComandoSerial() {
+  comandoSerial[comandoLen] = '\0';
+  procesarComando();
+  comandoLen = 0;
+  comandoSerial[0] = '\0';
 }
 
 void leerComandosSerial() {
   while (Serial.available() > 0) {
     const char c = Serial.read();
     if (c == '\n' || c == '\r') {
-      comandoSerial.trim();
-      procesarComando(comandoSerial);
-      comandoSerial = "";
-    } else if (comandoSerial.length() < 24) {
-      comandoSerial += c;
+      finalizarComandoSerial();
+    } else if (c >= 'a' && c <= 'z') {
+      if (comandoLen < sizeof(comandoSerial) - 1) {
+        comandoSerial[comandoLen++] = c - ('a' - 'A');
+      }
+    } else if (c != ' ' && comandoLen < sizeof(comandoSerial) - 1) {
+      comandoSerial[comandoLen++] = c;
     }
   }
   return fase;
@@ -354,18 +370,18 @@ void loop() {
   noInterrupts();
   const uint8_t canalCopiar = canalListo;
   for (uint8_t n = 0; n < NUM_MUESTRAS; n++) {
-    bufferDSP[canalCopiar][n] = bufferADC[canalCopiar][n];
-    ultimoBloque[canalCopiar][n] = bufferDSP[canalCopiar][n];
+    bloqueTrabajo[n] = bufferADC[canalCopiar][n];
+    ultimoBloque[canalCopiar][n] = bloqueTrabajo[n];
   }
   bloqueCompleto = false;
   interrupts();
 
   if (dspActivo) {
     if (canalCopiar == ADC_CANAL_TX) {
-      estadoDSP.tx = procesarLockIn(bufferDSP[ADC_CANAL_TX]);
+      estadoDSP.tx = procesarLockIn(bloqueTrabajo);
       estadoDSP.txValido = true;
     } else {
-      estadoDSP.rx = procesarLockIn(bufferDSP[ADC_CANAL_RX]);
+      estadoDSP.rx = procesarLockIn(bloqueTrabajo);
       estadoDSP.rxValido = true;
     }
 
