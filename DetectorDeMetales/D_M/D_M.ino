@@ -85,6 +85,8 @@ volatile bool descartarConversion = false;
 volatile uint16_t bufferADC[2][NUM_MUESTRAS];
 
 uint16_t bufferDSP[2][NUM_MUESTRAS];
+uint16_t ultimoBloque[2][NUM_MUESTRAS];
+
 
 struct ResultadoDSP {
   int32_t i;
@@ -92,6 +94,23 @@ struct ResultadoDSP {
   float amplitud;
   float faseRad;
 };
+
+struct EstadoDSP {
+  ResultadoDSP tx;
+  ResultadoDSP rx;
+  float deltaRad;
+  float deltaCalibradoRad;
+  bool txValido;
+  bool rxValido;
+  bool calibrado;
+};
+
+EstadoDSP estadoDSP = {};
+bool txActivo = true;
+bool dspActivo = true;
+float faseReferenciaRad = 0.0f;
+String comandoSerial;
+
 
 ISR(TIMER1_COMPA_vect) {
   OCR2B = pgm_read_byte(&tablaSenoPWM[indicePWM]);
@@ -122,6 +141,18 @@ ISR(ADC_vect) {
   }
 }
 
+void activarTX(bool activar) {
+  txActivo = activar;
+  if (activar) {
+    indicePWM = 0;
+    OCR2B = 128;
+    TIMSK1 |= _BV(OCIE1A);
+  } else {
+    TIMSK1 &= ~_BV(OCIE1A);
+    OCR2B = 128;
+  }
+}
+
 void configurarSPWM() {
   pinMode(PIN_PWM_TX, OUTPUT);
 
@@ -137,6 +168,7 @@ void configurarSPWM() {
   const uint32_t ciclosActualizacion = MCU_CLOCK_HZ / F_UPDATE_HZ;
   OCR1A = (ciclosActualizacion > 1) ? (ciclosActualizacion - 1) : 1;
   TIMSK1 = _BV(OCIE1A);
+  activarTX(true);
 }
 
 void configurarADC() {
@@ -170,6 +202,10 @@ ResultadoDSP procesarLockIn(const uint16_t *datos) {
   return r;
 }
 
+float radAGrados(float rad) {
+  return rad * 180.0f / PI;
+}
+
 float normalizarFase(float fase) {
   while (fase > PI) {
     fase -= TWO_PI;
@@ -180,14 +216,137 @@ float normalizarFase(float fase) {
   return fase;
 }
 
+void enviarBloqueCanal(uint8_t canal, const __FlashStringHelper *etiqueta) {
+  for (uint8_t n = 0; n < NUM_MUESTRAS; n++) {
+    Serial.print(etiqueta);
+    Serial.print(',');
+    Serial.print(n);
+    Serial.print(',');
+    Serial.println(ultimoBloque[canal][n]);
+  }
+}
+
+void enviarBloquesTXRX() {
+  for (uint8_t n = 0; n < NUM_MUESTRAS; n++) {
+    Serial.print(F("DATA,"));
+    Serial.print(n);
+    Serial.print(',');
+    Serial.print(ultimoBloque[ADC_CANAL_TX][n]);
+    Serial.print(',');
+    Serial.println(ultimoBloque[ADC_CANAL_RX][n]);
+  }
+}
+
+void enviarResultadoCanal(const __FlashStringHelper *etiqueta, const ResultadoDSP &r) {
+  Serial.print(F("RESULT,"));
+  Serial.print(etiqueta);
+  Serial.print(',');
+  Serial.print(r.i);
+  Serial.print(',');
+  Serial.print(r.q);
+  Serial.print(',');
+  Serial.print(r.amplitud, 1);
+  Serial.print(',');
+  Serial.println(radAGrados(r.faseRad), 3);
+}
+
+void enviarResultadosDSP() {
+  if (!estadoDSP.txValido || !estadoDSP.rxValido) {
+    Serial.println(F("RESULT,WAITING_FOR_BLOCKS"));
+    return;
+  }
+
+  enviarResultadoCanal(F("TX"), estadoDSP.tx);
+  enviarResultadoCanal(F("RX"), estadoDSP.rx);
+  Serial.print(F("DELTA_PHASE,"));
+  Serial.print(radAGrados(estadoDSP.deltaRad), 3);
+  Serial.print(F(",CAL,"));
+  Serial.println(radAGrados(estadoDSP.deltaCalibradoRad), 3);
+}
+
+void calibrarFaseBase() {
+  if (!estadoDSP.txValido || !estadoDSP.rxValido) {
+    Serial.println(F("BASE_PHASE,WAITING_FOR_DSP"));
+    return;
+  }
+
+  faseReferenciaRad = estadoDSP.deltaRad;
+  estadoDSP.calibrado = true;
+  estadoDSP.deltaCalibradoRad = 0.0f;
+  Serial.print(F("BASE_PHASE,"));
+  Serial.println(radAGrados(faseReferenciaRad), 3);
+}
+
+void enviarEstado() {
+  Serial.print(F("STATUS,TX,"));
+  Serial.print(txActivo ? F("ON") : F("OFF"));
+  Serial.print(F(",DSP,"));
+  Serial.print(dspActivo ? F("ON") : F("OFF"));
+  Serial.print(F(",CAL,"));
+  Serial.print(estadoDSP.calibrado ? F("YES") : F("NO"));
+  Serial.print(F(",F_TX,"));
+  Serial.print(F_TX_HZ);
+  Serial.print(F(",SAMPLES,"));
+  Serial.println(NUM_MUESTRAS);
+}
+
+void procesarComando(const String &cmd) {
+  if (cmd == F("TX_ON")) {
+    activarTX(true);
+    Serial.println(F("OK,TX_ON"));
+  } else if (cmd == F("TX_OFF")) {
+    activarTX(false);
+    Serial.println(F("OK,TX_OFF"));
+  } else if (cmd == F("READ_TX") || cmd == F("DEBUG_TX")) {
+    enviarBloqueCanal(ADC_CANAL_TX, F("TX"));
+  } else if (cmd == F("READ_RX") || cmd == F("DEBUG_RX")) {
+    enviarBloqueCanal(ADC_CANAL_RX, F("RX"));
+  } else if (cmd == F("READ_ALL")) {
+    enviarBloquesTXRX();
+  } else if (cmd == F("DSP_ON")) {
+    dspActivo = true;
+    Serial.println(F("OK,DSP_ON"));
+  } else if (cmd == F("DSP_OFF")) {
+    dspActivo = false;
+    Serial.println(F("OK,DSP_OFF"));
+  } else if (cmd == F("RESULT") || cmd == F("READ_DSP")) {
+    enviarResultadosDSP();
+  } else if (cmd == F("CAL")) {
+    calibrarFaseBase();
+  } else if (cmd == F("STATUS")) {
+    enviarEstado();
+  } else if (cmd.length() > 0) {
+    Serial.print(F("ERR,UNKNOWN_CMD,"));
+    Serial.println(cmd);
+  }
+}
+
+void leerComandosSerial() {
+  while (Serial.available() > 0) {
+    const char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      comandoSerial.trim();
+      procesarComando(comandoSerial);
+      comandoSerial = "";
+    } else if (comandoSerial.length() < 24) {
+      comandoSerial += c;
+    }
+  }
+  return fase;
+}
+
 void setup() {
   Serial.begin(115200);
   configurarSPWM();
   configurarADC();
   sei();
+  Serial.println(F("READY,metal_detector_phase_debug,115200"));
+  enviarEstado();
 }
 
 void loop() {
+  leerComandosSerial();
+
   if (!bloqueCompleto) {
     return;
   }
@@ -196,35 +355,27 @@ void loop() {
   const uint8_t canalCopiar = canalListo;
   for (uint8_t n = 0; n < NUM_MUESTRAS; n++) {
     bufferDSP[canalCopiar][n] = bufferADC[canalCopiar][n];
+    ultimoBloque[canalCopiar][n] = bufferDSP[canalCopiar][n];
   }
   bloqueCompleto = false;
   interrupts();
 
-  static bool txValido = false;
-  static bool rxValido = false;
-  static ResultadoDSP tx = {};
-  static ResultadoDSP rx = {};
+  if (dspActivo) {
+    if (canalCopiar == ADC_CANAL_TX) {
+      estadoDSP.tx = procesarLockIn(bufferDSP[ADC_CANAL_TX]);
+      estadoDSP.txValido = true;
+    } else {
+      estadoDSP.rx = procesarLockIn(bufferDSP[ADC_CANAL_RX]);
+      estadoDSP.rxValido = true;
+    }
 
-  if (canalCopiar == ADC_CANAL_TX) {
-    tx = procesarLockIn(bufferDSP[ADC_CANAL_TX]);
-    txValido = true;
-  } else {
-    rx = procesarLockIn(bufferDSP[ADC_CANAL_RX]);
-    rxValido = true;
+    if (estadoDSP.txValido && estadoDSP.rxValido) {
+      estadoDSP.deltaRad = normalizarFase(estadoDSP.rx.faseRad - estadoDSP.tx.faseRad);
+      estadoDSP.deltaCalibradoRad = estadoDSP.calibrado
+        ? normalizarFase(estadoDSP.deltaRad - faseReferenciaRad)
+        : estadoDSP.deltaRad;
+    }
   }
 
-  if (txValido && rxValido) {
-    const float deltaPhi = normalizarFase(rx.faseRad - tx.faseRad);
-
-    Serial.print(F("A_TX="));
-    Serial.print(tx.amplitud, 1);
-    Serial.print(F(" A_RX="));
-    Serial.print(rx.amplitud, 1);
-    Serial.print(F(" Phi_TX="));
-    Serial.print(tx.faseRad, 5);
-    Serial.print(F(" Phi_RX="));
-    Serial.print(rx.faseRad, 5);
-    Serial.print(F(" DeltaPhi="));
-    Serial.println(deltaPhi, 5);
-  }
+  leerComandosSerial();
 }
