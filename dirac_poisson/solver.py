@@ -10,7 +10,7 @@ from scipy.sparse.linalg import eigsh
 from constants import MC2
 from dirac_matrix import build_hamiltonian
 from grid import RadialGrid
-from poisson import charge_density, solve_poisson
+from poisson import solve_poisson_from_spinor
 
 
 @dataclass
@@ -33,6 +33,7 @@ class SolverResult:
     phi: np.ndarray
     electric_field: np.ndarray
     rho: np.ndarray
+    enclosed_charge: np.ndarray
     energy: float
     delta: float
     iterations: int
@@ -68,14 +69,13 @@ def solve(grid: RadialGrid, config: SolverConfig) -> SolverResult:
     delta = float("inf")
     phi = np.zeros_like(grid.r)
     electric_field = np.zeros_like(grid.r)
-    rho = charge_density(F, G)
+    phi, electric_field, enclosed_charge, rho = solve_poisson_from_spinor(grid.r, grid.dr, F, G)
 
     for iteration in range(1, config.max_iterations + 1):
         old_F = F.copy()
         old_G = G.copy()
 
-        rho = charge_density(F, G)
-        phi, electric_field, _ = solve_poisson(grid.r, grid.dr, rho)
+        phi, electric_field, enclosed_charge, rho = solve_poisson_from_spinor(grid.r, grid.dr, F, G)
         hamiltonian = build_hamiltonian(grid.r, grid.dr, phi, kappa=config.kappa)
 
         eigenvalues, eigenvectors = eigsh(hamiltonian, k=1, sigma=MC2, which="LM")
@@ -95,14 +95,14 @@ def solve(grid: RadialGrid, config: SolverConfig) -> SolverResult:
         if delta < config.tolerance:
             break
 
-    rho = charge_density(F, G)
-    phi, electric_field, _ = solve_poisson(grid.r, grid.dr, rho)
+    phi, electric_field, enclosed_charge, rho = solve_poisson_from_spinor(grid.r, grid.dr, F, G)
     return SolverResult(
         F=F,
         G=G,
         phi=phi,
         electric_field=electric_field,
         rho=rho,
+        enclosed_charge=enclosed_charge,
         energy=energy,
         delta=delta,
         iterations=iteration,

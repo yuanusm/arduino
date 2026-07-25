@@ -7,11 +7,11 @@ from pathlib import Path
 import numpy as np
 
 
-def save_csv(path: Path, r: np.ndarray, F: np.ndarray, G: np.ndarray, phi: np.ndarray, electric_field: np.ndarray, rho: np.ndarray) -> None:
+def save_csv(path: Path, r: np.ndarray, F: np.ndarray, G: np.ndarray, phi: np.ndarray, electric_field: np.ndarray, rho: np.ndarray, enclosed_charge: np.ndarray) -> None:
     """Save radial arrays to CSV without requiring plotting dependencies."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = np.column_stack([r, F, G, phi, electric_field, rho])
-    header = "r_m,F,G,phi_V,electric_field_V_per_m,rho_C_per_m3"
+    data = np.column_stack([r, F, G, phi, electric_field, rho, enclosed_charge])
+    header = "r_m,F,G,phi_V,electric_field_V_per_m,rho_C_per_m3,enclosed_charge_C"
     np.savetxt(path, data, delimiter=",", header=header, comments="")
 
 

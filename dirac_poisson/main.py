@@ -13,7 +13,7 @@ from solver import SolverConfig, solve
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Solver autoconsistente Dirac--Poisson radial con masa fija m_e.")
-    parser.add_argument("--rmax", type=float, default=1.0e-10, help="Radio maximo de la malla en metros.")
+    parser.add_argument("--rmax", type=float, default=5.0e-10, help="Radio maximo de la malla en metros.")
     parser.add_argument("--points", type=int, default=800, help="Numero de puntos radiales.")
     parser.add_argument("--alpha", type=float, default=0.2, help="Factor de mezcla para estabilidad.")
     parser.add_argument("--tol", type=float, default=1.0e-8, help="Tolerancia de convergencia para el espinor.")
@@ -31,7 +31,7 @@ def main() -> None:
     result = solve(grid, config)
 
     args.output.mkdir(parents=True, exist_ok=True)
-    save_csv(args.output / "solution.csv", grid.r, result.F, result.G, result.phi, result.electric_field, result.rho)
+    save_csv(args.output / "solution.csv", grid.r, result.F, result.G, result.phi, result.electric_field, result.rho, result.enclosed_charge)
     if args.plot:
         save_plots(args.output / "diagnostics.png", grid.r, result.F, result.G, result.phi, result.rho)
 
@@ -42,6 +42,7 @@ def main() -> None:
     print(f"mc2_J={MC2:.12e}")
     print(f"energy_minus_mc2_J={result.energy - MC2:.12e}")
     print(f"rms_radius_m={result.rms_radius:.12e}")
+    print(f"total_charge_C={result.enclosed_charge[-1]:.12e}")
     print(f"csv={args.output / 'solution.csv'}")
 
 
